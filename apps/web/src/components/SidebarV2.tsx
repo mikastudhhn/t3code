@@ -1,6 +1,27 @@
 import { autoAnimate } from "@formkit/auto-animate";
 import { useAtomValue } from "@effect/atom-react";
 import {
+  closestCenter,
+  DndContext,
+  KeyboardCode,
+  KeyboardSensor,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type Announcements,
+  type CollisionDetection,
+  type DragEndEvent,
+  type ScreenReaderInstructions,
+} from "@dnd-kit/core";
+import { restrictToFirstScrollableAncestor, restrictToVerticalAxis } from "@dnd-kit/modifiers";
+import {
+  sortableKeyboardCoordinates,
+  SortableContext,
+  useSortable,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import {
   canSnooze,
   effectiveSettled,
   effectiveSnoozed,
@@ -42,8 +63,11 @@ import {
   useMemo,
   useRef,
   useState,
+  type ComponentProps,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
+  type CSSProperties,
   type ReactNode,
 } from "react";
 import { useParams, useRouter } from "@tanstack/react-router";
@@ -81,7 +105,11 @@ import {
   type SidebarProjectSnapshot,
 } from "../sidebarProjectGrouping";
 import { useSidebarProjectScopeStore } from "../sidebarProjectScopeStore";
-import { legacyProjectCwdPreferenceKey, useUiStateStore } from "../uiStateStore";
+import {
+  legacyProjectCwdPreferenceKey,
+  type SidebarV2ThreadSection,
+  useUiStateStore,
+} from "../uiStateStore";
 import { useThreadSelectionStore } from "../threadSelectionStore";
 import { useThreadActions } from "../hooks/useThreadActions";
 import { useHandleNewThread } from "../hooks/useHandleNewThread";
@@ -109,13 +137,17 @@ import { cn } from "~/lib/utils";
 import {
   formatWorkingDurationLabel,
   firstValidTimestampMs,
+  handleSidebarV2SortableRowKeyDown,
   hasUnseenCompletion,
   isTrailingDoubleClick,
   orderItemsByPreferredIds,
+  orderItemsByPreferredIdsWithUnrankedFirst,
   resolveAdjacentThreadId,
   resolveSettledTimestamp,
+  resolveSidebarV2ThreadReorder,
   resolveSidebarV2Status,
   resolveWorkingStartedAt,
+  shouldDisableSidebarV2RowTooltip,
   shouldNavigateAfterProjectRemoval,
   sortLogicalProjectsForSidebar,
   sortSettledThreadsForSidebarV2,
@@ -164,11 +196,44 @@ import { useComposerDraftStore } from "../composerDraftStore";
 // stays behind an explicit Show more.
 const SETTLED_TAIL_INITIAL_COUNT = 10;
 const SETTLED_TAIL_PAGE_COUNT = 25;
+const SIDEBAR_V2_THREAD_SECTION_LABELS: Record<SidebarV2ThreadSection, string> = {
+  active: "Active chats",
+  snoozed: "Snoozed chats",
+  settled: "Settled chats",
+};
+const SIDEBAR_V2_THREAD_DND_MODIFIERS = [restrictToVerticalAxis, restrictToFirstScrollableAncestor];
+const THREAD_ROW_NESTED_CONTROL_SELECTOR =
+  "a, button, input, select, textarea, [contenteditable]:not([contenteditable='false'])";
 const PROJECT_GROUPING_MODE_LABELS: Record<SidebarProjectGroupingMode, string> = {
   repository: "Group by repository",
   repository_path: "Group by repository path",
   separate: "Keep separate",
 };
+
+function sidebarV2ThreadKey(thread: Pick<SidebarThreadSummary, "environmentId" | "id">): string {
+  return scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
+}
+
+function threadDragTitle(data: Record<string, unknown> | undefined, fallback: string): string {
+  return typeof data?.threadTitle === "string" ? data.threadTitle : fallback;
+}
+
+function threadDragPosition(data: Record<string, unknown> | undefined): {
+  position: number;
+  count: number;
+} | null {
+  if (typeof data?.sectionPosition === "number" && typeof data.sectionCount === "number") {
+    return { position: data.sectionPosition, count: data.sectionCount };
+  }
+  return null;
+}
+
+function threadDragSectionLabel(data: Record<string, unknown> | undefined): string {
+  const section = data?.section;
+  return section === "active" || section === "snoozed" || section === "settled"
+    ? SIDEBAR_V2_THREAD_SECTION_LABELS[section]
+    : "chats";
+}
 
 function compactSidebarTimeLabel(label: string): string {
   if (label === "just now") return "now";
@@ -357,7 +422,19 @@ function SnoozePopoverButton(props: {
   );
 }
 
-const SidebarV2Row = memo(function SidebarV2Row(props: {
+type SortableThreadActivatorProps = Pick<
+  ReturnType<typeof useSortable>,
+  "attributes" | "listeners" | "setActivatorNodeRef"
+>;
+
+interface SidebarV2SortableRowProps {
+  setNodeRef: ReturnType<typeof useSortable>["setNodeRef"];
+  style: CSSProperties;
+  isDragging: boolean;
+  activatorProps: SortableThreadActivatorProps;
+}
+
+interface SidebarV2RowProps {
   thread: SidebarThreadSummary;
   variant: "card" | "slim";
   // Slim rows are either settled (action: un-settle) or merely quiet
@@ -394,7 +471,39 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
   onSnooze: (threadRef: ScopedThreadRef, preset: SnoozePreset) => void;
   onUnsnooze: (threadRef: ScopedThreadRef) => void;
   onChangeRequestState: (threadKey: string, state: "open" | "closed" | "merged" | null) => void;
+  sortable: SidebarV2SortableRowProps;
+}
+
+function SidebarV2ThreadDndProvider(
+  props: Pick<
+    ComponentProps<typeof DndContext>,
+    "accessibility" | "children" | "collisionDetection" | "onDragEnd" | "sensors"
+  >,
+) {
+  return (
+    <DndContext {...props} modifiers={SIDEBAR_V2_THREAD_DND_MODIFIERS}>
+      <TooltipProvider delay={150} closeDelay={0} timeout={400}>
+        {props.children}
+      </TooltipProvider>
+    </DndContext>
+  );
+}
+
+function SidebarV2SortableThreadList(props: {
+  children: ReactNode;
+  items: string[];
+  listRef: (node: HTMLUListElement | null) => void;
 }) {
+  return (
+    <SortableContext items={props.items} strategy={verticalListSortingStrategy}>
+      <ul ref={props.listRef} role="list" className="flex flex-col gap-px">
+        {props.children}
+      </ul>
+    </SortableContext>
+  );
+}
+
+const SidebarV2Row = memo(function SidebarV2Row(props: SidebarV2RowProps) {
   const {
     isRenaming,
     onChangeRequestState,
@@ -556,14 +665,35 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
     },
     [onContextMenu, threadRef],
   );
-  const handleKeyDown = useCallback(
+  const handleSortableKeyDown = useCallback(
     (event: ReactKeyboardEvent) => {
-      if (event.target !== event.currentTarget) return;
-      if (event.key !== "Enter" && event.key !== " ") return;
-      event.preventDefault();
-      onThreadActivate(threadRef);
+      handleSidebarV2SortableRowKeyDown({
+        event,
+        isDragging: props.sortable.isDragging,
+        onSortableKeyDown: (sortableEvent) =>
+          props.sortable.activatorProps.listeners?.onKeyDown?.(sortableEvent),
+        onActivate: () => onThreadActivate(threadRef),
+      });
     },
-    [onThreadActivate, threadRef],
+    [
+      onThreadActivate,
+      props.sortable.activatorProps.listeners,
+      props.sortable.isDragging,
+      threadRef,
+    ],
+  );
+  const handleSortablePointerDown = useCallback(
+    (event: ReactPointerEvent) => {
+      const target = event.target as Element;
+      if (
+        target !== event.currentTarget &&
+        target.closest(THREAD_ROW_NESTED_CONTROL_SELECTOR) !== null
+      ) {
+        return;
+      }
+      props.sortable.activatorProps.listeners?.onPointerDown?.(event);
+    },
+    [props.sortable.activatorProps.listeners],
   );
   const handleDoubleClick = useCallback(
     (event: ReactMouseEvent) => {
@@ -737,20 +867,29 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
   if (variant === "slim") {
     return (
       <li
+        ref={props.sortable.setNodeRef}
+        style={props.sortable.style}
         data-thread-item
-        className="list-none [content-visibility:auto] [contain-intrinsic-size:auto_34px]"
+        className={cn(
+          "list-none [content-visibility:auto] [contain-intrinsic-size:auto_34px]",
+          props.sortable.isDragging && "z-20 opacity-60",
+        )}
       >
-        <Tooltip>
+        <Tooltip disabled={shouldDisableSidebarV2RowTooltip(props.sortable.isDragging)}>
           <TooltipTrigger
             render={
               <div
+                ref={props.sortable.activatorProps.setActivatorNodeRef}
+                {...props.sortable.activatorProps.attributes}
+                {...props.sortable.activatorProps.listeners}
                 role="button"
                 tabIndex={0}
                 data-testid="sidebar-v2-row-slim"
                 className={cn(rowSurfaceClassName, "flex h-9 items-center gap-2.5 px-2.5")}
                 onClick={handleClick}
                 onDoubleClick={handleDoubleClick}
-                onKeyDown={handleKeyDown}
+                onKeyDown={handleSortableKeyDown}
+                onPointerDown={handleSortablePointerDown}
                 onContextMenu={handleContextMenu}
               />
             }
@@ -846,20 +985,29 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
 
   return (
     <li
+      ref={props.sortable.setNodeRef}
+      style={props.sortable.style}
       data-thread-item
-      className="list-none py-0.5 [content-visibility:auto] [contain-intrinsic-size:auto_96px]"
+      className={cn(
+        "list-none py-0.5 [content-visibility:auto] [contain-intrinsic-size:auto_96px]",
+        props.sortable.isDragging && "z-20 opacity-60",
+      )}
     >
-      <Tooltip>
+      <Tooltip disabled={shouldDisableSidebarV2RowTooltip(props.sortable.isDragging)}>
         <TooltipTrigger
           render={
             <div
+              ref={props.sortable.activatorProps.setActivatorNodeRef}
+              {...props.sortable.activatorProps.attributes}
+              {...props.sortable.activatorProps.listeners}
               role="button"
               tabIndex={0}
               data-testid="sidebar-v2-row-card"
               className={rowSurfaceClassName}
               onClick={handleClick}
               onDoubleClick={handleDoubleClick}
-              onKeyDown={handleKeyDown}
+              onKeyDown={handleSortableKeyDown}
+              onPointerDown={handleSortablePointerDown}
               onContextMenu={handleContextMenu}
             />
           }
@@ -990,6 +1138,52 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
   );
 });
 
+function SortableSidebarV2Row(
+  props: Omit<SidebarV2RowProps, "sortable"> & {
+    section: SidebarV2ThreadSection;
+    sectionPosition: number;
+    sectionCount: number;
+  },
+) {
+  const threadKey = sidebarV2ThreadKey(props.thread);
+  const {
+    attributes,
+    listeners,
+    isDragging,
+    setActivatorNodeRef,
+    setNodeRef,
+    transform,
+    transition,
+  } = useSortable({
+    id: threadKey,
+    disabled: props.isRenaming,
+    data: {
+      section: props.section,
+      sectionPosition: props.sectionPosition,
+      sectionCount: props.sectionCount,
+      threadTitle: props.thread.title,
+    },
+  });
+  return (
+    <SidebarV2Row
+      {...props}
+      sortable={{
+        setNodeRef,
+        style: {
+          transform: CSS.Translate.toString(transform),
+          transition,
+        },
+        isDragging,
+        activatorProps: {
+          attributes,
+          listeners,
+          setActivatorNodeRef,
+        },
+      }}
+    />
+  );
+}
+
 function latestTurnDiff(
   thread: SidebarThreadSummary,
 ): { insertions: number; deletions: number } | null {
@@ -1002,6 +1196,8 @@ function latestTurnDiff(
 export default function SidebarV2() {
   const projects = useProjects();
   const projectOrder = useUiStateStore((store) => store.projectOrder);
+  const threadOrder = useUiStateStore((store) => store.threadOrder);
+  const reorderThreadPreference = useUiStateStore((store) => store.reorderThreads);
   const threads = useThreadShells();
   const router = useRouter();
   const { isMobile, setOpenMobile } = useSidebar();
@@ -1418,15 +1614,31 @@ export default function SidebarV2() {
         active.push(thread);
       }
     }
+    const sortedActive = sortThreadsForSidebarV2(active);
+    const sortedSnoozed = snoozed.toSorted(
+      (left, right) =>
+        firstValidTimestampMs(left.snoozedUntil ?? null) -
+        firstValidTimestampMs(right.snoozedUntil ?? null),
+    );
+    const sortedSettled = sortSettledThreadsForSidebarV2(settled);
     return {
-      activeThreads: sortThreadsForSidebarV2(active),
-      // Soonest wake first: "what comes back next" is the shelf's question.
-      snoozedThreads: snoozed.toSorted(
-        (left, right) =>
-          firstValidTimestampMs(left.snoozedUntil ?? null) -
-          firstValidTimestampMs(right.snoozedUntil ?? null),
-      ),
-      settledThreads: sortSettledThreadsForSidebarV2(settled),
+      activeThreads: orderItemsByPreferredIdsWithUnrankedFirst({
+        items: sortedActive,
+        preferredIds: threadOrder.active,
+        getId: sidebarV2ThreadKey,
+      }),
+      // Before manual ranking, soonest wake comes first: "what comes back
+      // next" is the shelf's default question.
+      snoozedThreads: orderItemsByPreferredIdsWithUnrankedFirst({
+        items: sortedSnoozed,
+        preferredIds: threadOrder.snoozed,
+        getId: sidebarV2ThreadKey,
+      }),
+      settledThreads: orderItemsByPreferredIdsWithUnrankedFirst({
+        items: sortedSettled,
+        preferredIds: threadOrder.settled,
+        getId: sidebarV2ThreadKey,
+      }),
       snoozeNow: preciseNow,
     };
   }, [
@@ -1436,6 +1648,7 @@ export default function SidebarV2() {
     scopedProjectKeys,
     serverConfigs,
     snoozeWakeTick,
+    threadOrder,
     threads,
   ]);
 
@@ -1538,6 +1751,119 @@ export default function SidebarV2() {
   // rendered at click time.
   const orderedThreadKeysRef = useRef(orderedThreadKeys);
   orderedThreadKeysRef.current = orderedThreadKeys;
+  const threadDndSensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: { distance: 6 },
+    }),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+      keyboardCodes: {
+        start: [KeyboardCode.Space],
+        cancel: [KeyboardCode.Esc],
+        end: [KeyboardCode.Space, KeyboardCode.Tab],
+      },
+    }),
+  );
+  const threadSectionByKey = useMemo(() => {
+    const sections = new Map<string, SidebarV2ThreadSection>();
+    for (const thread of activeThreads) sections.set(sidebarV2ThreadKey(thread), "active");
+    for (const thread of snoozedThreads) sections.set(sidebarV2ThreadKey(thread), "snoozed");
+    for (const thread of settledThreads) sections.set(sidebarV2ThreadKey(thread), "settled");
+    return sections;
+  }, [activeThreads, settledThreads, snoozedThreads]);
+  const threadOrderBySection = useMemo<Record<SidebarV2ThreadSection, string[]>>(
+    () => ({
+      active: activeThreads.map(sidebarV2ThreadKey),
+      snoozed: snoozedThreads.map(sidebarV2ThreadKey),
+      settled: settledThreads.map(sidebarV2ThreadKey),
+    }),
+    [activeThreads, settledThreads, snoozedThreads],
+  );
+  const threadPositionByKey = useMemo(() => {
+    const positions = new Map<string, { position: number; count: number }>();
+    for (const ids of Object.values(threadOrderBySection)) {
+      for (const [index, id] of ids.entries()) {
+        positions.set(id, { position: index + 1, count: ids.length });
+      }
+    }
+    return positions;
+  }, [threadOrderBySection]);
+  const threadCollisionDetection = useCallback<CollisionDetection>((args) => {
+    const activeSection = args.active.data.current?.section;
+    const collisions = closestCenter(args);
+    const closestCollision = collisions[0];
+    if (closestCollision === undefined) return [];
+    const closestSection = args.droppableContainers.find(
+      (container) => container.id === closestCollision.id,
+    )?.data.current?.section;
+    if (closestSection !== activeSection) return [];
+    return collisions.filter(
+      (collision) =>
+        args.droppableContainers.find((container) => container.id === collision.id)?.data.current
+          ?.section === activeSection,
+    );
+  }, []);
+  const handleThreadDragEnd = useCallback(
+    (event: DragEndEvent) => {
+      const activeId = typeof event.active.id === "string" ? event.active.id : null;
+      const overId = typeof event.over?.id === "string" ? event.over.id : null;
+      if (activeId === null) return;
+      const reorder = resolveSidebarV2ThreadReorder({
+        activeId,
+        overId,
+        sectionByThreadId: threadSectionByKey,
+        threadIdsBySection: threadOrderBySection,
+      });
+      if (reorder === null) return;
+      reorderThreadPreference(
+        reorder.section,
+        reorder.currentThreadOrder,
+        reorder.draggedThreadId,
+        reorder.targetThreadId,
+      );
+    },
+    [reorderThreadPreference, threadOrderBySection, threadSectionByKey],
+  );
+  const threadDndAccessibility = useMemo<{
+    announcements: Announcements;
+    screenReaderInstructions: ScreenReaderInstructions;
+  }>(
+    () => ({
+      screenReaderInstructions: {
+        draggable:
+          "To pick up a focused chat, press Space. Use the arrow keys to move it, press Space to drop it, or press Escape to cancel. Press Enter to open the chat.",
+      },
+      announcements: {
+        onDragStart({ active }) {
+          const title = threadDragTitle(active.data.current, String(active.id));
+          const section = threadDragSectionLabel(active.data.current);
+          return `Picked up ${title} in ${section}.`;
+        },
+        onDragOver({ active, over }) {
+          if (over === null) return "The chat is no longer over a valid drop target.";
+          const title = threadDragTitle(active.data.current, String(active.id));
+          const section = threadDragSectionLabel(active.data.current);
+          const position = threadDragPosition(over.data.current);
+          return position
+            ? `${title} is over position ${position.position} of ${position.count} in ${section}.`
+            : `${title} is over ${threadDragTitle(over.data.current, String(over.id))}.`;
+        },
+        onDragEnd({ active, over }) {
+          const title = threadDragTitle(active.data.current, String(active.id));
+          if (over === null || active.id === over.id) return `${title} was not moved.`;
+          const section = threadDragSectionLabel(active.data.current);
+          const position = threadDragPosition(over.data.current);
+          return position
+            ? `Moved ${title} to position ${position.position} of ${position.count} in ${section}.`
+            : `Moved ${title} in ${section}.`;
+        },
+        onDragCancel({ active }) {
+          return `Cancelled moving ${threadDragTitle(active.data.current, String(active.id))}.`;
+        },
+      },
+    }),
+    [],
+  );
   const threadByKey = useMemo(
     () =>
       new Map(
@@ -2418,13 +2744,17 @@ export default function SidebarV2() {
         }
       >
         <SidebarGroup className="px-2 pb-1 pt-0">
-          <TooltipProvider
-            key="sidebar-thread-tooltips-150"
-            delay={150}
-            closeDelay={0}
-            timeout={400}
+          <SidebarV2ThreadDndProvider
+            key="sidebar-thread-dnd-and-tooltips"
+            accessibility={threadDndAccessibility}
+            sensors={threadDndSensors}
+            collisionDetection={threadCollisionDetection}
+            onDragEnd={handleThreadDragEnd}
           >
-            <ul ref={attachListAutoAnimateRef} role="list" className="flex flex-col gap-px">
+            <SidebarV2SortableThreadList
+              items={orderedThreadKeys}
+              listRef={attachListAutoAnimateRef}
+            >
               {(() => {
                 const renderThreadRow = (
                   thread: EnvironmentThreadShell,
@@ -2439,8 +2769,9 @@ export default function SidebarV2() {
                   // not from the sidebar second-guessing what still matters.
                   const isCard = section === "active";
                   const rowVariant = isCard ? "card" : "slim";
+                  const sectionPosition = threadPositionByKey.get(threadKey);
                   return (
-                    <SidebarV2Row
+                    <SortableSidebarV2Row
                       // Keyed per variant on purpose: when a thread settles,
                       // the card fades out in place and the slim row fades
                       // in at its settled position instead of one element
@@ -2448,6 +2779,9 @@ export default function SidebarV2() {
                       // are translucent, so a crossing row reads as text
                       // painted over text).
                       key={`${threadKey}:${rowVariant}`}
+                      section={section}
+                      sectionPosition={sectionPosition?.position ?? 1}
+                      sectionCount={sectionPosition?.count ?? 1}
                       thread={thread}
                       variant={rowVariant}
                       // Snoozed rows wake; settled rows un-settle (explicit
@@ -2586,8 +2920,8 @@ export default function SidebarV2() {
                   </button>
                 </li>
               ) : null}
-            </ul>
-          </TooltipProvider>
+            </SidebarV2SortableThreadList>
+          </SidebarV2ThreadDndProvider>
           {activeThreads.length + snoozedThreads.length + settledThreads.length === 0 ? (
             <div className="flex flex-col items-center gap-2 px-2 py-6 text-center text-xs text-muted-foreground/60">
               {projects.length === 0 ? (

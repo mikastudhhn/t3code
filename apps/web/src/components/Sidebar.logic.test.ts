@@ -13,7 +13,9 @@ import {
   isContextMenuPointerDown,
   isTrailingDoubleClick,
   orderItemsByPreferredIds,
+  orderItemsByPreferredIdsWithUnrankedFirst,
   resolveProjectStatusIndicator,
+  resolveSidebarV2ThreadReorder,
   resolveSidebarStageBadgeLabel,
   resolveThreadRowClassName,
   resolveSidebarV2Status,
@@ -677,6 +679,162 @@ describe("sortThreadsForSidebarV2", () => {
     ]);
 
     expect(sorted.map((thread) => thread.id)).toEqual(["a", "b"]);
+  });
+});
+
+describe("orderItemsByPreferredIdsWithUnrankedFirst", () => {
+  const items = [{ id: "newest" }, { id: "middle" }, { id: "oldest" }] as const;
+
+  it("keeps newly created unranked chats above a saved manual order", () => {
+    const ordered = orderItemsByPreferredIdsWithUnrankedFirst({
+      items,
+      preferredIds: ["oldest", "middle"],
+      getId: (item) => item.id,
+    });
+
+    expect(ordered.map((item) => item.id)).toEqual(["newest", "oldest", "middle"]);
+  });
+
+  it("applies a saved order consistently to filtered lists", () => {
+    const ordered = orderItemsByPreferredIdsWithUnrankedFirst({
+      items: [items[0], items[2]],
+      preferredIds: ["oldest", "middle", "newest"],
+      getId: (item) => item.id,
+    });
+
+    expect(ordered.map((item) => item.id)).toEqual(["oldest", "newest"]);
+  });
+
+  it("retains the saved rank when a pinned chat stays active", () => {
+    const pinnedItems = [
+      { id: "newest", pinned: false },
+      { id: "oldest", pinned: true },
+    ] as const;
+    const ordered = orderItemsByPreferredIdsWithUnrankedFirst({
+      items: pinnedItems,
+      preferredIds: ["oldest", "newest"],
+      getId: (item) => item.id,
+    });
+
+    expect(ordered.map((item) => item.id)).toEqual(["oldest", "newest"]);
+  });
+
+  it("ignores stale saved ids without disturbing the remaining manual order", () => {
+    const ordered = orderItemsByPreferredIdsWithUnrankedFirst({
+      items,
+      preferredIds: ["removed", "oldest", "middle", "newest"],
+      getId: (item) => item.id,
+    });
+
+    expect(ordered.map((item) => item.id)).toEqual(["oldest", "middle", "newest"]);
+  });
+
+  it("preserves the established fallback order before any manual reorder", () => {
+    const ordered = orderItemsByPreferredIdsWithUnrankedFirst({
+      items,
+      preferredIds: [],
+      getId: (item) => item.id,
+    });
+
+    expect(ordered).toEqual(items);
+  });
+
+  it("uses only the destination lifecycle order when a chat changes sections", () => {
+    const transitioned = { id: "transitioned" };
+    const settledHistory = Array.from({ length: 11 }, (_, index) => ({
+      id: `settled-${index + 1}`,
+    }));
+    const orderedSettled = orderItemsByPreferredIdsWithUnrankedFirst({
+      items: [transitioned, ...settledHistory],
+      preferredIds: settledHistory.map((item) => item.id),
+      getId: (item) => item.id,
+    });
+
+    expect(orderedSettled[0]).toBe(transitioned);
+    expect(orderedSettled.slice(0, 10)).toContain(transitioned);
+  });
+
+  it("does not carry an Active rank into the Snoozed shelf", () => {
+    const orderedSnoozed = orderItemsByPreferredIdsWithUnrankedFirst({
+      items: [{ id: "newly-snoozed" }, { id: "later-wake" }, { id: "sooner-wake" }],
+      preferredIds: ["sooner-wake", "later-wake"],
+      getId: (item) => item.id,
+    });
+
+    expect(orderedSnoozed.map((item) => item.id)).toEqual([
+      "newly-snoozed",
+      "sooner-wake",
+      "later-wake",
+    ]);
+  });
+
+  it("restores a section's own rank when a chat returns to that lifecycle", () => {
+    const active = [{ id: "active-a" }, { id: "returning" }, { id: "active-b" }];
+    const ordered = orderItemsByPreferredIdsWithUnrankedFirst({
+      items: active,
+      preferredIds: ["active-b", "returning", "active-a"],
+      getId: (item) => item.id,
+    });
+
+    expect(ordered.map((item) => item.id)).toEqual(["active-b", "returning", "active-a"]);
+  });
+});
+
+describe("resolveSidebarV2ThreadReorder", () => {
+  const sectionByThreadId = new Map([
+    ["active-a", "active"],
+    ["active-b", "active"],
+    ["settled-a", "settled"],
+  ] as const);
+  const threadIdsBySection = {
+    active: ["active-a", "active-b"],
+    settled: ["settled-a"],
+  } as const;
+
+  it("resolves a reorder within one lifecycle section", () => {
+    expect(
+      resolveSidebarV2ThreadReorder({
+        activeId: "active-a",
+        overId: "active-b",
+        sectionByThreadId,
+        threadIdsBySection,
+      }),
+    ).toEqual({
+      section: "active",
+      currentThreadOrder: ["active-a", "active-b"],
+      draggedThreadId: "active-a",
+      targetThreadId: "active-b",
+    });
+  });
+
+  it("rejects drops across lifecycle section boundaries", () => {
+    expect(
+      resolveSidebarV2ThreadReorder({
+        activeId: "active-a",
+        overId: "settled-a",
+        sectionByThreadId,
+        threadIdsBySection,
+      }),
+    ).toBeNull();
+  });
+
+  it("ignores missing and unchanged destinations", () => {
+    expect(
+      resolveSidebarV2ThreadReorder({
+        activeId: "active-a",
+        overId: null,
+        sectionByThreadId,
+        threadIdsBySection,
+      }),
+    ).toBeNull();
+    expect(
+      resolveSidebarV2ThreadReorder({
+        activeId: "active-a",
+        overId: "active-a",
+        sectionByThreadId,
+        threadIdsBySection,
+      }),
+    ).toBeNull();
   });
 });
 

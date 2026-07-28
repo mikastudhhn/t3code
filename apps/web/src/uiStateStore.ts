@@ -1,9 +1,13 @@
 import { Debouncer } from "@tanstack/react-pacer";
+import { parseScopedThreadKey } from "@t3tools/client-runtime/environment";
 import { create } from "zustand";
 import { normalizeProjectPathForComparison } from "./lib/projectPaths";
 
 export const PERSISTED_STATE_KEY = "t3code:ui-state:v1";
 const THREAD_CHANGED_FILES_EXPANSION_VERSION = 1;
+export const SIDEBAR_V2_THREAD_SECTIONS = ["active", "snoozed", "settled"] as const;
+export type SidebarV2ThreadSection = (typeof SIDEBAR_V2_THREAD_SECTIONS)[number];
+export type SidebarV2ThreadOrder = Record<SidebarV2ThreadSection, string[]>;
 const LEGACY_PERSISTED_STATE_KEYS = [
   "t3code:renderer-state:v8",
   "t3code:renderer-state:v7",
@@ -20,6 +24,7 @@ const LEGACY_PERSISTED_STATE_KEYS = [
 export interface PersistedUiState {
   projectExpandedById?: Record<string, boolean>;
   projectOrder?: string[];
+  threadOrder?: string[] | Partial<SidebarV2ThreadOrder>;
   threadLastVisitedAtById?: Record<string, string>;
   collapsedProjectCwds?: string[];
   expandedProjectCwds?: string[];
@@ -35,6 +40,7 @@ export interface UiProjectState {
 }
 
 export interface UiThreadState {
+  threadOrder: SidebarV2ThreadOrder;
   threadLastVisitedAtById: Record<string, string>;
   threadChangedFilesExpandedById: Record<string, Record<string, boolean>>;
 }
@@ -48,6 +54,11 @@ export interface UiState extends UiProjectState, UiThreadState, UiEndpointState 
 const initialState: UiState = {
   projectExpandedById: {},
   projectOrder: [],
+  threadOrder: {
+    active: [],
+    snoozed: [],
+    settled: [],
+  },
   threadLastVisitedAtById: {},
   threadChangedFilesExpandedById: {},
   defaultAdvertisedEndpointKey: null,
@@ -70,6 +81,29 @@ function sanitizeStringArray(value: unknown): string[] {
       value.filter((entry): entry is string => typeof entry === "string" && entry.length > 0),
     ),
   ];
+}
+
+function sanitizeScopedThreadKeyArray(value: unknown): string[] {
+  return sanitizeStringArray(value).filter((key) => parseScopedThreadKey(key) !== null);
+}
+
+function sanitizeSidebarV2ThreadOrder(value: unknown): SidebarV2ThreadOrder {
+  if (Array.isArray(value)) {
+    // Early builds stored one global order. Preserve its most common Active
+    // ordering without allowing ranks to follow chats into another lifecycle
+    // shelf, where they could hide newly settled work behind pagination.
+    return {
+      active: sanitizeScopedThreadKeyArray(value),
+      snoozed: [],
+      settled: [],
+    };
+  }
+  const record = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  return {
+    active: sanitizeScopedThreadKeyArray(record.active),
+    snoozed: sanitizeScopedThreadKeyArray(record.snoozed),
+    settled: sanitizeScopedThreadKeyArray(record.settled),
+  };
 }
 
 function sanitizeBooleanRecord(value: unknown): Record<string, boolean> {
@@ -125,6 +159,7 @@ export function parsePersistedState(parsed: PersistedUiState): UiState {
   return {
     projectExpandedById,
     projectOrder,
+    threadOrder: sanitizeSidebarV2ThreadOrder(parsed.threadOrder),
     threadLastVisitedAtById: sanitizeTimestampRecord(parsed.threadLastVisitedAtById),
     threadChangedFilesExpandedById:
       parsed.threadChangedFilesExpansionVersion === THREAD_CHANGED_FILES_EXPANSION_VERSION
@@ -203,6 +238,7 @@ export function persistState(state: UiState): void {
       JSON.stringify({
         projectExpandedById,
         projectOrder: state.projectOrder,
+        threadOrder: state.threadOrder,
         threadLastVisitedAtById: state.threadLastVisitedAtById,
         defaultAdvertisedEndpointKey: state.defaultAdvertisedEndpointKey,
         threadChangedFilesExpansionVersion: THREAD_CHANGED_FILES_EXPANSION_VERSION,
@@ -381,6 +417,62 @@ export function reorderProjects(
   };
 }
 
+export function reorderThreads(
+  state: UiState,
+  section: SidebarV2ThreadSection,
+  currentThreadOrder: readonly string[],
+  draggedThreadId: string,
+  targetThreadId: string,
+): UiState {
+  const draggedIndex = currentThreadOrder.indexOf(draggedThreadId);
+  const targetIndex = currentThreadOrder.indexOf(targetThreadId);
+  if (draggedIndex < 0 || targetIndex < 0 || draggedIndex === targetIndex) {
+    return state;
+  }
+
+  const reorderedVisibleIds = [...currentThreadOrder];
+  const [dragged] = reorderedVisibleIds.splice(draggedIndex, 1);
+  if (dragged === undefined) {
+    return state;
+  }
+  reorderedVisibleIds.splice(targetIndex, 0, dragged);
+
+  // A project scope is a filter, not a separate ordering namespace. Replace
+  // only the visible ids in their existing preference slots so a filtered
+  // reorder cannot scramble hidden chats or lifecycle sections. Newly
+  // visible ids have no slot yet; place them beside the final replaced slot.
+  const visibleIdSet = new Set(currentThreadOrder);
+  const replacementIds = [...reorderedVisibleIds];
+  const sectionOrder = state.threadOrder[section];
+  const lastVisiblePreferenceIndex = sectionOrder.findLastIndex((id) => visibleIdSet.has(id));
+  const threadOrder: string[] = [];
+  for (const [index, id] of sectionOrder.entries()) {
+    if (!visibleIdSet.has(id)) {
+      threadOrder.push(id);
+      continue;
+    }
+
+    const replacement = replacementIds.shift();
+    if (replacement !== undefined) {
+      threadOrder.push(replacement);
+    }
+    if (index === lastVisiblePreferenceIndex && replacementIds.length > 0) {
+      threadOrder.push(...replacementIds.splice(0));
+    }
+  }
+  if (lastVisiblePreferenceIndex < 0) {
+    threadOrder.push(...replacementIds);
+  }
+
+  return {
+    ...state,
+    threadOrder: {
+      ...state.threadOrder,
+      [section]: threadOrder,
+    },
+  };
+}
+
 interface UiStateStore extends UiState {
   markThreadVisited: (threadId: string, visitedAt: string) => void;
   markThreadUnread: (threadId: string, latestTurnCompletedAt: string | null | undefined) => void;
@@ -391,6 +483,12 @@ interface UiStateStore extends UiState {
     currentProjectOrder: readonly string[],
     draggedProjectIds: readonly string[],
     targetProjectIds: readonly string[],
+  ) => void;
+  reorderThreads: (
+    section: SidebarV2ThreadSection,
+    currentThreadOrder: readonly string[],
+    draggedThreadId: string,
+    targetThreadId: string,
   ) => void;
 }
 
@@ -409,6 +507,10 @@ export const useUiStateStore = create<UiStateStore>((set) => ({
   reorderProjects: (currentProjectOrder, draggedProjectIds, targetProjectIds) =>
     set((state) =>
       reorderProjects(state, currentProjectOrder, draggedProjectIds, targetProjectIds),
+    ),
+  reorderThreads: (section, currentThreadOrder, draggedThreadId, targetThreadId) =>
+    set((state) =>
+      reorderThreads(state, section, currentThreadOrder, draggedThreadId, targetThreadId),
     ),
 }));
 

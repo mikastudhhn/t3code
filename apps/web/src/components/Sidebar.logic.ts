@@ -245,6 +245,32 @@ export function isTrailingDoubleClick(detail: number): boolean {
   return detail > 1;
 }
 
+interface SidebarV2SortableKeyEvent {
+  readonly key: string;
+  readonly target: unknown;
+  readonly currentTarget: unknown;
+  readonly defaultPrevented: boolean;
+  preventDefault: () => void;
+}
+
+export function handleSidebarV2SortableRowKeyDown<TEvent extends SidebarV2SortableKeyEvent>(input: {
+  event: TEvent;
+  isDragging: boolean;
+  onSortableKeyDown?: (event: TEvent) => void;
+  onActivate: () => void;
+}): void {
+  input.onSortableKeyDown?.(input.event);
+  if (input.isDragging || input.event.defaultPrevented) return;
+  if (input.event.target !== input.event.currentTarget) return;
+  if (input.event.key !== "Enter" && input.event.key !== " ") return;
+  input.event.preventDefault();
+  input.onActivate();
+}
+
+export function shouldDisableSidebarV2RowTooltip(isDragging: boolean): boolean {
+  return isDragging;
+}
+
 export function orderItemsByPreferredIds<TItem, TId>(input: {
   items: readonly TItem[];
   preferredIds: readonly TId[];
@@ -282,6 +308,49 @@ export function orderItemsByPreferredIds<TItem, TId>(input: {
   });
   const remaining = items.filter((_, index) => !emittedIndexes.has(index));
   return [...ordered, ...remaining];
+}
+
+export function orderItemsByPreferredIdsWithUnrankedFirst<TItem, TId>(input: {
+  items: readonly TItem[];
+  preferredIds: readonly TId[];
+  getId: (item: TItem) => TId;
+}): TItem[] {
+  if (input.preferredIds.length === 0) {
+    return [...input.items];
+  }
+
+  const preferredIdSet = new Set(input.preferredIds);
+  const unranked = input.items.filter((item) => !preferredIdSet.has(input.getId(item)));
+  const ranked = orderItemsByPreferredIds({
+    items: input.items.filter((item) => preferredIdSet.has(input.getId(item))),
+    preferredIds: input.preferredIds,
+    getId: input.getId,
+  });
+  return [...unranked, ...ranked];
+}
+
+export function resolveSidebarV2ThreadReorder<TSection extends string>(input: {
+  activeId: string;
+  overId: string | null;
+  sectionByThreadId: ReadonlyMap<string, TSection>;
+  threadIdsBySection: Readonly<Record<TSection, readonly string[]>>;
+}): {
+  section: TSection;
+  currentThreadOrder: readonly string[];
+  draggedThreadId: string;
+  targetThreadId: string;
+} | null {
+  if (input.overId === null || input.activeId === input.overId) return null;
+  const activeSection = input.sectionByThreadId.get(input.activeId);
+  if (activeSection === undefined || input.sectionByThreadId.get(input.overId) !== activeSection) {
+    return null;
+  }
+  return {
+    section: activeSection,
+    currentThreadOrder: input.threadIdsBySection[activeSection],
+    draggedThreadId: input.activeId,
+    targetThreadId: input.overId,
+  };
 }
 
 export function getVisibleSidebarThreadIds<TThreadId>(

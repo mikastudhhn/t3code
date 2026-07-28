@@ -10,6 +10,7 @@ import {
   type PersistedUiState,
   persistState,
   reorderProjects,
+  reorderThreads,
   resolveProjectExpanded,
   setDefaultAdvertisedEndpointKey,
   setProjectExpanded,
@@ -21,6 +22,11 @@ function makeUiState(overrides: Partial<UiState> = {}): UiState {
   return {
     projectExpandedById: {},
     projectOrder: [],
+    threadOrder: {
+      active: [],
+      snoozed: [],
+      settled: [],
+    },
     threadLastVisitedAtById: {},
     threadChangedFilesExpandedById: {},
     defaultAdvertisedEndpointKey: null,
@@ -116,6 +122,126 @@ describe("uiStateStore pure functions", () => {
     );
   });
 
+  it("reorders chats from their currently rendered section order", () => {
+    const currentOrder = ["environment:thread-a", "environment:thread-b", "environment:thread-c"];
+
+    const next = reorderThreads(
+      makeUiState(),
+      "active",
+      currentOrder,
+      "environment:thread-a",
+      "environment:thread-c",
+    );
+
+    expect(next.threadOrder.active).toEqual([
+      "environment:thread-b",
+      "environment:thread-c",
+      "environment:thread-a",
+    ]);
+  });
+
+  it("preserves hidden chat positions when reordering a filtered subset", () => {
+    const state = makeUiState({
+      threadOrder: {
+        active: ["environment:thread-a", "environment:thread-hidden", "environment:thread-b"],
+        snoozed: [],
+        settled: ["environment:thread-settled"],
+      },
+    });
+
+    const next = reorderThreads(
+      state,
+      "active",
+      ["environment:thread-a", "environment:thread-new", "environment:thread-b"],
+      "environment:thread-b",
+      "environment:thread-a",
+    );
+
+    expect(next.threadOrder).toEqual({
+      active: [
+        "environment:thread-b",
+        "environment:thread-hidden",
+        "environment:thread-a",
+        "environment:thread-new",
+      ],
+      snoozed: [],
+      settled: ["environment:thread-settled"],
+    });
+  });
+
+  it("keeps identical raw thread ids distinct across environments", () => {
+    const state = makeUiState({
+      threadOrder: {
+        active: ["environment-a:thread-1", "environment-b:thread-1"],
+        snoozed: [],
+        settled: [],
+      },
+    });
+
+    const next = reorderThreads(
+      state,
+      "active",
+      ["environment-a:thread-1", "environment-b:thread-1"],
+      "environment-b:thread-1",
+      "environment-a:thread-1",
+    );
+
+    expect(next.threadOrder.active).toEqual(["environment-b:thread-1", "environment-a:thread-1"]);
+  });
+
+  it("updates only the reordered lifecycle section", () => {
+    const state = makeUiState({
+      threadOrder: {
+        active: ["environment:active-a", "environment:active-b"],
+        snoozed: ["environment:snoozed-a", "environment:snoozed-b"],
+        settled: ["environment:settled-a", "environment:settled-b"],
+      },
+    });
+
+    const next = reorderThreads(
+      state,
+      "snoozed",
+      state.threadOrder.snoozed,
+      "environment:snoozed-a",
+      "environment:snoozed-b",
+    );
+
+    expect(next.threadOrder).toEqual({
+      active: state.threadOrder.active,
+      snoozed: ["environment:snoozed-b", "environment:snoozed-a"],
+      settled: state.threadOrder.settled,
+    });
+  });
+
+  it("does not reorder chats across missing or identical drop targets", () => {
+    const state = makeUiState({
+      threadOrder: {
+        active: ["environment:thread-a"],
+        snoozed: [],
+        settled: [],
+      },
+    });
+
+    expect(
+      reorderThreads(
+        state,
+        "active",
+        ["environment:thread-a", "environment:thread-b"],
+        "environment:thread-a",
+        "environment:missing",
+      ),
+    ).toBe(state);
+    expect(
+      reorderThreads(
+        state,
+        "active",
+        ["environment:thread-a", "environment:thread-b"],
+        "environment:thread-a",
+        "environment:thread-a",
+      ),
+    ).toBe(state);
+  });
+
   it("stores explicit changed-file expansion choices", () => {
     const threadId = ThreadId.make("thread-1");
     const collapsed = setThreadChangedFilesExpanded(makeUiState(), threadId, "turn-1", false);
@@ -154,6 +280,15 @@ describe("parsePersistedState", () => {
         invalid: "no" as unknown as boolean,
       },
       projectOrder: ["physical-b", "", "physical-a", "physical-b"],
+      threadOrder: [
+        "environment:thread-b",
+        "",
+        "malformed",
+        ":missing-environment",
+        "missing-thread:",
+        "environment:thread-a",
+        "environment:thread-b",
+      ],
       threadLastVisitedAtById: {
         "environment:thread-1": "2026-02-25T12:35:00.000Z",
         invalid: "not-a-date",
@@ -173,6 +308,11 @@ describe("parsePersistedState", () => {
         logical: false,
       },
       projectOrder: ["physical-b", "physical-a"],
+      threadOrder: {
+        active: ["environment:thread-b", "environment:thread-a"],
+        snoozed: [],
+        settled: [],
+      },
       threadLastVisitedAtById: {
         "environment:thread-1": "2026-02-25T12:35:00.000Z",
       },
@@ -183,6 +323,22 @@ describe("parsePersistedState", () => {
           "turn-2": true,
         },
       },
+    });
+  });
+
+  it("sanitizes independent lifecycle orders", () => {
+    const parsed = parsePersistedState({
+      threadOrder: {
+        active: ["environment:active", "malformed"],
+        snoozed: ["environment:snoozed", "environment:snoozed"],
+        settled: ["environment:settled", ""],
+      },
+    });
+
+    expect(parsed.threadOrder).toEqual({
+      active: ["environment:active"],
+      snoozed: ["environment:snoozed"],
+      settled: ["environment:settled"],
     });
   });
 
@@ -270,6 +426,11 @@ describe("uiStateStore persistence", () => {
         logical: false,
       },
       projectOrder: ["physical-b", "physical-a"],
+      threadOrder: {
+        active: ["environment:thread-b", "environment:thread-a"],
+        snoozed: ["environment:thread-snoozed"],
+        settled: ["environment:thread-settled"],
+      },
       threadLastVisitedAtById: {
         "environment:thread-1": "2026-02-25T12:35:00.000Z",
       },
@@ -292,6 +453,11 @@ describe("uiStateStore persistence", () => {
         logical: false,
       },
       projectOrder: ["physical-b", "physical-a"],
+      threadOrder: {
+        active: ["environment:thread-b", "environment:thread-a"],
+        snoozed: ["environment:thread-snoozed"],
+        settled: ["environment:thread-settled"],
+      },
       threadLastVisitedAtById: {
         "environment:thread-1": "2026-02-25T12:35:00.000Z",
       },
