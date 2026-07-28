@@ -7,6 +7,7 @@ import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
@@ -167,6 +168,45 @@ describe("ResourceTelemetry", () => {
       ).pipe(Effect.provide(telemetryLayer));
 
       expect(Option.isSome(live)).toBe(true);
+      expect(yield* Ref.get(demandChanges)).toEqual([true, false]);
+    }),
+  );
+
+  it.effect("releases live demand when acquisition is interrupted by an idle collector", () =>
+    Effect.gen(function* () {
+      const sampledAtUnixMs = DateTime.toEpochMillis(yield* DateTime.now);
+      const demandChanges = yield* Ref.make<ReadonlyArray<boolean>>([]);
+      const nativeLayer = NativeTelemetryClient.layerTest({
+        sampleNow: Effect.never,
+        health: Effect.succeed({
+          status: "healthy",
+          hello: Option.none(),
+          lastSampleAt: Option.none(),
+          lastError: Option.none(),
+          restartCount: 0,
+          sampleIntervalMs: 1_000,
+        }),
+      });
+      const desktopLayer = DesktopTelemetryReceiver.layerTest({
+        latest: Effect.succeedSome(desktopSnapshot(sampledAtUnixMs)),
+        setDiagnosticsDemand: (enabled) =>
+          Ref.update(demandChanges, (changes) => [...changes, enabled]),
+      });
+      const telemetryLayer = ResourceTelemetry.layer.pipe(
+        Layer.provide(Layer.mergeAll(nativeLayer, desktopLayer, ResourceAttribution.layer)),
+      );
+
+      const resultFiber = yield* Stream.runHead(
+        Effect.gen(function* () {
+          const telemetry = yield* ResourceTelemetry.ResourceTelemetry;
+          return telemetry.changes;
+        }).pipe(Stream.unwrap),
+      ).pipe(Effect.timeoutOption("10 millis"), Effect.provide(telemetryLayer), Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("10 millis");
+      const result = yield* Fiber.join(resultFiber);
+
+      expect(Option.isNone(result)).toBe(true);
       expect(yield* Ref.get(demandChanges)).toEqual([true, false]);
     }),
   );

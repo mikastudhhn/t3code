@@ -9,20 +9,18 @@ import * as Option from "effect/Option";
 
 import * as ResourceTelemetry from "../resourceTelemetry/ResourceTelemetry.ts";
 
-export interface ProcessResourceMonitorShape {
-  readonly readHistory: (
-    input: ServerProcessResourceHistoryInput,
-  ) => Effect.Effect<ServerProcessResourceHistoryResult>;
-}
-
 export class ProcessResourceMonitor extends Context.Service<
   ProcessResourceMonitor,
-  ProcessResourceMonitorShape
+  {
+    readonly readHistory: (
+      input: ServerProcessResourceHistoryInput,
+    ) => Effect.Effect<ServerProcessResourceHistoryResult>;
+  }
 >()("t3/diagnostics/ProcessResourceMonitor") {}
 
 export const make = Effect.fn("makeProcessResourceMonitor")(function* () {
   const telemetry = yield* ResourceTelemetry.ResourceTelemetry;
-  const readHistory: ProcessResourceMonitorShape["readHistory"] = (input) =>
+  const readHistory: ProcessResourceMonitor["Service"]["readHistory"] = (input) =>
     telemetry.readHistory(input).pipe(
       Effect.map((history) => {
         const topProcesses = history.topProcesses.map((entry) => ({

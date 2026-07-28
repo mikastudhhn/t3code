@@ -49,22 +49,21 @@ export class ResourceTelemetryRefreshFailed extends Schema.TaggedErrorClass<Reso
   }
 }
 
-export interface ResourceTelemetryShape {
-  readonly latest: Effect.Effect<ResourceTelemetrySnapshot>;
-  readonly changes: Stream.Stream<ResourceTelemetrySnapshot>;
-  readonly readHistory: (
-    input: ResourceTelemetryHistoryInput,
-  ) => Effect.Effect<ResourceTelemetryHistory>;
-  readonly refresh: Effect.Effect<ResourceTelemetrySnapshot, ResourceTelemetryRefreshFailed>;
-  readonly validateProcessIdentity: (
-    identity: ResourceTelemetryProcessIdentity,
-  ) => Effect.Effect<boolean, ResourceTelemetryRefreshFailed>;
-  readonly retry: Effect.Effect<ResourceTelemetryRetryResult>;
-}
-
-export class ResourceTelemetry extends Context.Service<ResourceTelemetry, ResourceTelemetryShape>()(
-  "t3/resourceTelemetry/ResourceTelemetry",
-) {}
+export class ResourceTelemetry extends Context.Service<
+  ResourceTelemetry,
+  {
+    readonly latest: Effect.Effect<ResourceTelemetrySnapshot>;
+    readonly changes: Stream.Stream<ResourceTelemetrySnapshot>;
+    readonly readHistory: (
+      input: ResourceTelemetryHistoryInput,
+    ) => Effect.Effect<ResourceTelemetryHistory>;
+    readonly refresh: Effect.Effect<ResourceTelemetrySnapshot, ResourceTelemetryRefreshFailed>;
+    readonly validateProcessIdentity: (
+      identity: ResourceTelemetryProcessIdentity,
+    ) => Effect.Effect<boolean, ResourceTelemetryRefreshFailed>;
+    readonly retry: Effect.Effect<ResourceTelemetryRetryResult>;
+  }
+>()("t3/resourceTelemetry/ResourceTelemetry") {}
 
 interface TelemetryState {
   readonly nativeSnapshot: Option.Option<ResourceMonitorSnapshotEvent>;
@@ -141,7 +140,8 @@ export const make = Effect.fn("resourceTelemetry.resourceTelemetry.make")(functi
   const mutex = yield* Semaphore.make(1);
   const changes = yield* PubSub.sliding<ResourceTelemetrySnapshot>(8);
   const initialReadAt = yield* DateTime.now;
-  const initialDesktop = yield* desktopReceiver.latest;
+  const desktopSubscription = yield* desktopReceiver.subscribe;
+  const initialDesktop = desktopSubscription.latest;
   if (Option.isSome(initialDesktop)) {
     yield* nativeClient
       .setExternalProcesses([{ pid: initialDesktop.value.electronPid }])
@@ -311,33 +311,39 @@ export const make = Effect.fn("resourceTelemetry.resourceTelemetry.make")(functi
       return yield* rebuild({ desktopSnapshot: snapshot, updatePrevious: false, publish: live });
     });
 
-  yield* desktopReceiver.changes.pipe(
+  yield* desktopSubscription.changes.pipe(
     Stream.runForEach((snapshot) => ingestDesktop(snapshot)),
     Effect.forkScoped,
   );
 
   const acquireLive = liveMutex.withPermits(1)(
-    Effect.gen(function* () {
-      const current = yield* Ref.get(liveState);
-      if (current.retainCount > 0) {
-        yield* Ref.set(liveState, { ...current, retainCount: current.retainCount + 1 });
-        return;
-      }
+    Effect.uninterruptible(
+      Effect.gen(function* () {
+        const current = yield* Ref.get(liveState);
+        if (current.retainCount > 0) {
+          yield* Ref.set(liveState, { ...current, retainCount: current.retainCount + 1 });
+          return;
+        }
 
-      const scope = yield* Scope.make();
-      yield* Ref.set(liveState, { retainCount: 1, scope: Option.some(scope) });
-      yield* desktopReceiver.setDiagnosticsDemand(true).pipe(Effect.ignore);
-      yield* nativeClient.snapshots.pipe(
-        Stream.runForEach(ingestNative),
-        Effect.catch((error) =>
-          Effect.logWarning("Native resource telemetry stream stopped", {
-            cause: error.message,
-          }),
-        ),
-        Effect.forkIn(scope),
-      );
-      yield* nativeClient.sampleNow.pipe(Effect.flatMap(ingestNative), Effect.ignore);
-    }),
+        const scope = yield* Scope.make();
+        yield* desktopReceiver.setDiagnosticsDemand(true).pipe(Effect.ignore);
+        yield* nativeClient.snapshots.pipe(
+          Stream.runForEach(ingestNative),
+          Effect.catch((error) =>
+            Effect.logWarning("Native resource telemetry stream stopped", {
+              cause: error.message,
+            }),
+          ),
+          Effect.forkIn(scope),
+        );
+        yield* nativeClient.sampleNow.pipe(
+          Effect.flatMap(ingestNative),
+          Effect.ignore,
+          Effect.forkIn(scope),
+        );
+        yield* Ref.set(liveState, { retainCount: 1, scope: Option.some(scope) });
+      }),
+    ),
   );
 
   const releaseLive = liveMutex.withPermits(1)(
@@ -363,7 +369,7 @@ export const make = Effect.fn("resourceTelemetry.resourceTelemetry.make")(functi
     }),
   );
 
-  const readHistory: ResourceTelemetryShape["readHistory"] = (input) =>
+  const readHistory: ResourceTelemetry["Service"]["readHistory"] = (input) =>
     Effect.gen(function* () {
       const readAt = yield* DateTime.now;
       const normalizedInput = normalizeResourceTelemetryHistoryInput(input);
@@ -405,7 +411,7 @@ export const make = Effect.fn("resourceTelemetry.resourceTelemetry.make")(functi
     Effect.forkScoped,
   );
 
-  const refresh: ResourceTelemetryShape["refresh"] = nativeClient.sampleNow.pipe(
+  const refresh: ResourceTelemetry["Service"]["refresh"] = nativeClient.sampleNow.pipe(
     Effect.flatMap(ingestNative),
     Effect.mapError(
       (cause) =>
@@ -416,7 +422,9 @@ export const make = Effect.fn("resourceTelemetry.resourceTelemetry.make")(functi
     ),
   );
 
-  const validateProcessIdentity: ResourceTelemetryShape["validateProcessIdentity"] = (identity) =>
+  const validateProcessIdentity: ResourceTelemetry["Service"]["validateProcessIdentity"] = (
+    identity,
+  ) =>
     nativeClient.sampleNow.pipe(
       Effect.map((snapshot) =>
         snapshot.processes.some(

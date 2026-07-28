@@ -6,9 +6,12 @@ import {
   type ClientActivityReportInput,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
+import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 
 import { ServerSettingsService } from "../serverSettings.ts";
@@ -112,6 +115,59 @@ describe("BackgroundPolicy", () => {
     }).pipe(Effect.provide(makeLayer(nominalHostPower))),
   );
 
+  it.effect("serializes lease mutation publications", () =>
+    Effect.gen(function* () {
+      const firstSnapshotStarted = yield* Deferred.make<void>();
+      const releaseFirstSnapshot = yield* Deferred.make<void>();
+      const snapshotReads = yield* Ref.make(0);
+      const hostLayer = Layer.succeed(
+        HostPowerMonitor.HostPowerMonitor,
+        HostPowerMonitor.HostPowerMonitor.of({
+          snapshot: Ref.updateAndGet(snapshotReads, (count) => count + 1).pipe(
+            Effect.flatMap((count) =>
+              count === 1
+                ? Deferred.succeed(firstSnapshotStarted, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseFirstSnapshot)),
+                    Effect.as(nominalHostPower),
+                  )
+                : Effect.succeed(nominalHostPower),
+            ),
+          ),
+          report: () => Effect.void,
+          streamChanges: Stream.empty,
+        }),
+      );
+      const layer = BackgroundPolicy.layer.pipe(
+        Layer.provide(Layer.merge(hostLayer, ServerSettingsService.layerTest())),
+      );
+
+      yield* Effect.gen(function* () {
+        const policy = yield* BackgroundPolicy.BackgroundPolicy;
+        const updatesFiber = yield* policy.streamChanges.pipe(
+          Stream.take(2),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* Effect.yieldNow;
+        const reportFiber = yield* policy
+          .reportClientActivity(AuthSessionId.make("session-1"), RpcClientId.make(1), makeReport())
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(firstSnapshotStarted);
+        const removeFiber = yield* policy
+          .removeRpcClient(RpcClientId.make(1))
+          .pipe(Effect.forkChild);
+        yield* Effect.yieldNow;
+        yield* Deferred.succeed(releaseFirstSnapshot, undefined);
+        yield* Fiber.join(reportFiber);
+        yield* Fiber.join(removeFiber);
+        const updates = Array.from(yield* Fiber.join(updatesFiber));
+
+        assert.equal(updates.at(-1)?.activeForegroundLeaseCount, 0);
+        assert.deepStrictEqual(updates.at(-1)?.activeScopeKeys, []);
+      }).pipe(Effect.provide(layer));
+    }),
+  );
+
   it.effect("host low power mode disables opportunistic work without dropping scoped demand", () =>
     Effect.gen(function* () {
       const policy = yield* BackgroundPolicy.BackgroundPolicy;
@@ -128,6 +184,31 @@ describe("BackgroundPolicy", () => {
       assert.equal(yield* policy.hasDemand({ type: "vcs-status", cwd: "/repo" }), true);
       assert.equal(yield* policy.shouldRunScopeWork({ type: "vcs-status", cwd: "/repo" }), false);
     }).pipe(Effect.provide(makeLayer(constrainedHostPower))),
+  );
+
+  it.effect("host suspension disables scoped and opportunistic work", () =>
+    Effect.gen(function* () {
+      const policy = yield* BackgroundPolicy.BackgroundPolicy;
+      yield* policy.reportClientActivity(
+        AuthSessionId.make("session-1"),
+        RpcClientId.make(1),
+        makeReport(),
+      );
+
+      const snapshot = yield* policy.snapshot;
+      assert.equal(snapshot.activeForegroundLeaseCount, 1);
+      assert.equal(snapshot.shouldRunOpportunisticWork, false);
+      assert.equal(yield* policy.hasDemand({ type: "vcs-status", cwd: "/repo" }), true);
+      assert.equal(yield* policy.shouldRunScopeWork({ type: "vcs-status", cwd: "/repo" }), false);
+    }).pipe(
+      Effect.provide(
+        makeLayer({
+          ...nominalHostPower,
+          suspended: true,
+          stale: false,
+        }),
+      ),
+    ),
   );
 
   it.effect("keeps background demand visible while preventing scoped work", () =>

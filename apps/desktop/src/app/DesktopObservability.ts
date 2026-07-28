@@ -444,10 +444,7 @@ const makeBackendOutputLogShape = (
           }),
           persistFailure: Effect.fn("desktop.observability.backendOutput.persistFailure")(
             function* ({ details }) {
-              const session = yield* Ref.modify(sessionRef, (current) => [
-                current,
-                Option.map(current, (value) => ({ ...value, chunks: [], byteLength: 0 })),
-              ]);
+              const session = yield* Ref.modify(sessionRef, (current) => [current, Option.none()]);
               if (Option.isNone(session)) return;
 
               yield* writeBackendChildLogRecord(logFile, {

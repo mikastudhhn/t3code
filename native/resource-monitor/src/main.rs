@@ -12,10 +12,11 @@ const MAX_SAMPLE_INTERVAL_MS: u64 = 60_000;
 const EXTERNAL_PROCESS_START_TOLERANCE_MS: u64 = 2_000;
 const HISTORY_RETENTION_MS: u64 = 60 * 60_000;
 const MAX_HISTORY_SNAPSHOTS: usize = 3_600;
+const INPUT_QUEUE_CAPACITY: usize = 64;
 const MAX_HISTORY_PROCESS_SAMPLES: usize = 20_000;
 const HISTORY_CHUNK_SNAPSHOTS: usize = 32;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExternalProcess {
     pid: u32,
@@ -147,6 +148,7 @@ struct SnapshotEvent {
     inaccessible_process_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     request_id: Option<String>,
+    external_processes: Vec<ExternalProcess>,
     processes: Vec<ProcessSample>,
 }
 
@@ -251,16 +253,24 @@ impl Collector {
                 (pid, ppid, process.start_time().saturating_mul(1_000))
             })
             .collect::<Vec<_>>();
-        let mut roots = config
+        let external_processes = config
             .external_processes
             .iter()
             .filter_map(|(pid, expected_start_time_ms)| {
                 let (_, _, actual_start_time_ms) = rows
                     .iter()
                     .find(|(candidate_pid, _, _)| candidate_pid == pid)?;
-                matches_external_identity(*actual_start_time_ms, *expected_start_time_ms)
-                    .then_some(*pid)
+                matches_external_identity(*actual_start_time_ms, *expected_start_time_ms).then_some(
+                    ExternalProcess {
+                        pid: *pid,
+                        start_time_ms: Some(*actual_start_time_ms),
+                    },
+                )
             })
+            .collect::<Vec<_>>();
+        let mut roots = external_processes
+            .iter()
+            .map(|process| process.pid)
             .collect::<HashSet<_>>();
         roots.insert(config.root_pid);
         let tracked = select_tracked_pids(&rows, &roots);
@@ -311,6 +321,7 @@ impl Collector {
             retained_process_count: processes.len(),
             inaccessible_process_count: 0,
             request_id,
+            external_processes,
             processes,
         }
     }
@@ -321,7 +332,7 @@ fn process_refresh_kind() -> ProcessRefreshKind {
         .with_memory()
         .with_cpu()
         .with_disk_usage()
-        .with_cmd(UpdateKind::OnlyIfNotSet)
+        .with_cmd(UpdateKind::Always)
         .without_tasks()
 }
 
@@ -384,7 +395,7 @@ fn clamp_sample_interval(sample_interval_ms: u64) -> Option<Duration> {
 }
 
 fn spawn_input_reader() -> Receiver<Input> {
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::sync_channel(INPUT_QUEUE_CAPACITY);
     thread::spawn(move || {
         let stdin = io::stdin();
         for line in stdin.lock().lines() {
@@ -418,6 +429,14 @@ fn spawn_input_reader() -> Receiver<Input> {
         }
     });
     receiver
+}
+
+fn sample_now_deadline(
+    current: Option<Instant>,
+    interval: Option<Duration>,
+    now: Instant,
+) -> Option<Instant> {
+    current.or_else(|| interval.map(|duration| now + duration))
 }
 
 fn write_event<T: Serialize>(writer: &mut impl Write, event: &T) -> io::Result<()> {
@@ -509,6 +528,24 @@ fn main() -> io::Result<()> {
     let mut streaming_enabled = false;
 
     loop {
+        if next_sample_at.is_some_and(|deadline| deadline <= Instant::now()) {
+            if let Some(current) = config.as_ref() {
+                if let Some(interval) = current.sample_interval {
+                    let event = collector.sample(current, None);
+                    history.record(&event);
+                    if streaming_enabled {
+                        write_event(&mut writer, &event)?;
+                    }
+                    next_sample_at = Some(Instant::now() + interval);
+                } else {
+                    next_sample_at = None;
+                }
+            } else {
+                next_sample_at = None;
+            }
+            continue;
+        }
+
         let timeout = next_sample_at
             .map(|deadline| deadline.saturating_duration_since(Instant::now()))
             .unwrap_or(Duration::from_secs(60));
@@ -589,9 +626,11 @@ fn main() -> io::Result<()> {
                             let event = collector.sample(current, Some(request_id));
                             history.record(&event);
                             write_event(&mut writer, &event)?;
-                            next_sample_at = current
-                                .sample_interval
-                                .map(|interval| Instant::now() + interval);
+                            next_sample_at = sample_now_deadline(
+                                next_sample_at,
+                                current.sample_interval,
+                                Instant::now(),
+                            );
                         } else {
                             write_error(
                                 &mut writer,
@@ -621,20 +660,7 @@ fn main() -> io::Result<()> {
                     Command::Shutdown { .. } => return Ok(()),
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {
-                if let Some(current) = config.as_ref() {
-                    if let Some(interval) = current.sample_interval {
-                        let event = collector.sample(current, None);
-                        history.record(&event);
-                        if streaming_enabled {
-                            write_event(&mut writer, &event)?;
-                        }
-                        next_sample_at = Some(Instant::now() + interval);
-                    } else {
-                        next_sample_at = None;
-                    }
-                }
-            }
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
     }
@@ -734,6 +760,10 @@ mod tests {
                 retained_process_count: 0,
                 inaccessible_process_count: 0,
                 request_id: Some("request".to_owned()),
+                external_processes: vec![ExternalProcess {
+                    pid: 7,
+                    start_time_ms: Some(1_000),
+                }],
                 processes: Vec::new(),
             });
         }
@@ -745,6 +775,11 @@ mod tests {
                 .iter()
                 .all(|snapshot| snapshot.request_id.is_none())
         );
+        assert!(history.snapshots.iter().all(|snapshot| {
+            snapshot.external_processes.len() == 1
+                && snapshot.external_processes[0].pid == 7
+                && snapshot.external_processes[0].start_time_ms == Some(1_000)
+        }));
         assert_eq!(
             history
                 .read(10_000, MAX_HISTORY_SNAPSHOTS as u64 * 1_000)
@@ -757,10 +792,25 @@ mod tests {
     fn refreshes_commands_without_enumerating_linux_tasks() {
         let refresh_kind = process_refresh_kind();
 
-        assert_eq!(refresh_kind.cmd(), UpdateKind::OnlyIfNotSet);
+        assert_eq!(refresh_kind.cmd(), UpdateKind::Always);
         assert!(!refresh_kind.tasks());
         assert!(refresh_kind.cpu());
         assert!(refresh_kind.memory());
         assert!(refresh_kind.disk_usage());
+    }
+
+    #[test]
+    fn sample_now_does_not_postpone_an_existing_periodic_deadline() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(1);
+
+        assert_eq!(
+            sample_now_deadline(
+                Some(deadline),
+                Some(Duration::from_secs(5)),
+                now + Duration::from_millis(100)
+            ),
+            Some(deadline)
+        );
     }
 }

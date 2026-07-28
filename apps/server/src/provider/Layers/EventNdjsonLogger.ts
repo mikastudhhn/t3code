@@ -20,7 +20,7 @@ import * as Scope from "effect/Scope";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 
 import { toSafeThreadAttachmentSegment } from "../../attachmentStore.ts";
-import type { ResourceAttributionShape } from "../../resourceTelemetry/ResourceAttribution.ts";
+import type { ResourceAttribution } from "../../resourceTelemetry/ResourceAttribution.ts";
 
 const MEBIBYTE = 1024 * 1024;
 const DAY_MS = 24 * 60 * 60 * 1_000;
@@ -34,7 +34,6 @@ const DEFAULT_MAX_BUFFERED_BYTES = MEBIBYTE;
 const DEFAULT_MAX_BUFFERED_RECORDS = 512;
 const GLOBAL_THREAD_SEGMENT = "_global";
 const LOG_SCOPE = "provider-observability";
-const PROVIDER_LOG_FILE_PATTERN = /\.log(?:\.\d+)?$/u;
 const encodeUnknownJsonString = Schema.encodeUnknownEffect(Schema.UnknownFromJsonString);
 
 const transientCanonicalEventTypes = new Set([
@@ -70,7 +69,7 @@ export interface EventNdjsonLogStoreOptions {
   readonly retentionCheckIntervalMs?: number;
   readonly maxBufferedBytes?: number;
   readonly maxBufferedRecords?: number;
-  readonly attribution?: ResourceAttributionShape;
+  readonly attribution?: ResourceAttribution["Service"];
 }
 
 export interface EventNdjsonLoggerOptions extends EventNdjsonLogStoreOptions {
@@ -116,7 +115,7 @@ interface ResolvedOptions {
   readonly retentionCheckIntervalMs: number;
   readonly maxBufferedBytes: number;
   readonly maxBufferedRecords: number;
-  readonly attribution: ResourceAttributionShape | undefined;
+  readonly attribution: ResourceAttribution["Service"] | undefined;
 }
 
 interface PendingRecord {
@@ -130,7 +129,6 @@ interface StoreState {
   readonly pending: ReadonlyArray<PendingRecord>;
   readonly pendingBytes: number;
   readonly sinks: ReadonlyMap<string, RotatingFileSink>;
-  readonly failedSegments: ReadonlySet<string>;
   readonly flushScheduled: boolean;
   readonly closed: boolean;
   readonly lastRetentionAt: number;
@@ -166,7 +164,17 @@ function resolveThreadSegment(raw: string | null | undefined): string {
 }
 
 function resolveStreamLabel(stream: EventNdjsonStream): string {
-  return stream === "native" ? "NTIVE" : "CANON";
+  return stream === "native" ? "NTIVE" : stream === "orchestration" ? "ORCH" : "CANON";
+}
+
+function providerLogPrefix(filePath: string): string {
+  const basename = NodePath.basename(filePath);
+  const extension = NodePath.extname(basename);
+  return `${extension.length > 0 ? basename.slice(0, -extension.length) : basename}.`;
+}
+
+function providerLogPath(directory: string, prefix: string, threadSegment: string): string {
+  return NodePath.join(directory, `${prefix}${threadSegment}.log`);
 }
 
 function shouldPersist(stream: EventNdjsonStream, event: unknown): boolean {
@@ -210,6 +218,7 @@ function enforceRetention(input: {
   readonly maxTotalBytes: number;
   readonly maxAgeMs: number;
   readonly activeFilePaths: ReadonlySet<string>;
+  readonly filePrefix: string;
   readonly now: number;
 }): RetentionResult {
   const failures: Array<FileOperationFailure> = [];
@@ -223,7 +232,12 @@ function enforceRetention(input: {
   }
 
   for (const entry of entries) {
-    if (!entry.isFile() || !PROVIDER_LOG_FILE_PATTERN.test(entry.name)) continue;
+    if (
+      !entry.isFile() ||
+      !entry.name.startsWith(input.filePrefix) ||
+      !/\.log(?:\.\d+)?$/u.test(entry.name)
+    )
+      continue;
     const filePath = NodePath.join(input.directory, entry.name);
     try {
       const stat = NodeFS.statSync(filePath);
@@ -310,6 +324,7 @@ function drainPending(input: {
   readonly directory: string;
   readonly options: ResolvedOptions;
   readonly state: StoreState;
+  readonly filePrefix: string;
   readonly now: number;
   readonly timerFired: boolean;
   readonly close: boolean;
@@ -319,7 +334,6 @@ function drainPending(input: {
   }
 
   const sinks = new Map(input.state.sinks);
-  const failedSegments = new Set(input.state.failedSegments);
   const failures: Array<FileOperationFailure> = [];
   const attributionByStream = new Map<
     EventNdjsonStream,
@@ -334,8 +348,7 @@ function drainPending(input: {
   }
 
   for (const [threadSegment, records] of recordsBySegment) {
-    if (failedSegments.has(threadSegment)) continue;
-    const filePath = NodePath.join(input.directory, `${threadSegment}.log`);
+    const filePath = providerLogPath(input.directory, input.filePrefix, threadSegment);
     let sink = sinks.get(threadSegment);
     if (!sink) {
       try {
@@ -347,7 +360,6 @@ function drainPending(input: {
         });
         sinks.set(threadSegment, sink);
       } catch (cause) {
-        failedSegments.add(threadSegment);
         failures.push({ filePath, cause });
         continue;
       }
@@ -366,7 +378,7 @@ function drainPending(input: {
         });
       }
     } catch (cause) {
-      failedSegments.add(threadSegment);
+      sinks.delete(threadSegment);
       failures.push({ filePath, cause });
     }
   }
@@ -379,10 +391,11 @@ function drainPending(input: {
         maxTotalBytes: input.options.maxTotalBytes,
         maxAgeMs: input.options.maxAgeMs,
         activeFilePaths: new Set(
-          Array.from(sinks.keys(), (threadSegment) =>
-            NodePath.join(input.directory, `${threadSegment}.log`),
+          Array.from(recordsBySegment.keys(), (threadSegment) =>
+            providerLogPath(input.directory, input.filePrefix, threadSegment),
           ),
         ),
+        filePrefix: input.filePrefix,
         now: input.now,
       })
     : { failures: [] };
@@ -399,7 +412,6 @@ function drainPending(input: {
       pending: [],
       pendingBytes: 0,
       sinks,
-      failedSegments,
       flushScheduled: input.timerFired ? false : input.state.flushScheduled,
       closed: input.close,
       lastRetentionAt: retentionDue ? input.now : input.state.lastRetentionAt,
@@ -423,6 +435,7 @@ export const makeEventNdjsonLogStore = Effect.fnUntraced(function* (
 ): Effect.fn.Return<EventNdjsonLogStore, EventNdjsonLogStoreError> {
   const resolved = yield* resolveOptions(filePath, options);
   const directory = NodePath.dirname(filePath);
+  const filePrefix = providerLogPrefix(filePath);
 
   yield* Effect.try({
     try: () => NodeFS.mkdirSync(directory, { recursive: true }),
@@ -436,6 +449,7 @@ export const makeEventNdjsonLogStore = Effect.fnUntraced(function* (
       maxTotalBytes: resolved.maxTotalBytes,
       maxAgeMs: resolved.maxAgeMs,
       activeFilePaths: new Set(),
+      filePrefix,
       now: initializedAt,
     }),
   );
@@ -450,7 +464,6 @@ export const makeEventNdjsonLogStore = Effect.fnUntraced(function* (
     pending: [],
     pendingBytes: 0,
     sinks: new Map(),
-    failedSegments: new Set(),
     flushScheduled: false,
     closed: false,
     lastRetentionAt: initializedAt,
@@ -465,6 +478,7 @@ export const makeEventNdjsonLogStore = Effect.fnUntraced(function* (
           directory,
           options: resolved,
           state,
+          filePrefix,
           now: startedAt,
           timerFired,
           close,
@@ -562,7 +576,7 @@ export const makeEventNdjsonLogStore = Effect.fnUntraced(function* (
       }
     });
 
-    const view = { filePath, write, close } satisfies EventNdjsonLogger;
+    const view = { filePath, write, close: () => Effect.void } satisfies EventNdjsonLogger;
     loggerViews.set(stream, view);
     return view;
   };
@@ -581,5 +595,6 @@ export const makeEventNdjsonLogger = Effect.fnUntraced(function* (
       ),
     ),
   );
-  return store?.logger(options.stream);
+  if (!store) return undefined;
+  return { ...store.logger(options.stream), close: store.close };
 });

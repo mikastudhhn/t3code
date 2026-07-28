@@ -73,7 +73,7 @@ describe("ProcessResourceMonitor", () => {
           inaccessibleProcessCount: 0,
         },
       };
-      const telemetry: ResourceTelemetry.ResourceTelemetryShape = {
+      const telemetry: ResourceTelemetry.ResourceTelemetry["Service"] = {
         latest: Effect.die("unused"),
         changes: Stream.empty,
         readHistory: () => Effect.succeed(history),

@@ -211,11 +211,11 @@ function durationToSeconds(duration: Duration.Duration): number {
   return Math.round(Duration.toMillis(duration) / 1_000);
 }
 
-function normalizeIntervalSeconds(value: number | null): number {
+function normalizeIntervalSeconds(value: number | null, minimum = 0): number {
   if (value === null || !Number.isFinite(value)) {
-    return 0;
+    return minimum;
   }
-  return Math.max(0, Math.round(value));
+  return Math.max(minimum, Math.round(value));
 }
 
 function resolveBackgroundActivityProfileOption(settings: {
@@ -244,10 +244,19 @@ function backgroundActivityProfileSettings(profile: BackgroundActivityProfile) {
 
 function backgroundActivityOverrideSettings(
   current: BackgroundActivitySettings,
+  resolved: ReturnType<typeof resolveServerBackgroundActivitySettings>,
   overrides: BackgroundActivityOverridePatch,
 ) {
   const nextOverrides: BackgroundActivityOverridePatch = {
-    ...current.overrides,
+    automaticGitFetchInterval: resolved.automaticGitFetchInterval,
+    providerHealthRefreshInterval: resolved.providerHealthRefreshInterval,
+    hostPowerMonitorActiveInterval: resolved.hostPowerMonitorActiveInterval,
+    hostPowerMonitorIdleInterval: resolved.hostPowerMonitorIdleInterval,
+    idleClientTtl: resolved.idleClientTtl,
+    pauseWhenHostLocked: resolved.pauseWhenHostLocked,
+    pauseWhenHostLowPower: resolved.pauseWhenHostLowPower,
+    pauseWhenClientLowPower: resolved.pauseWhenClientLowPower,
+    pauseWhenOnBattery: resolved.pauseWhenOnBattery,
     ...overrides,
   };
   for (const [key, value] of Object.entries(nextOverrides)) {
@@ -762,11 +771,15 @@ function BackgroundActivityAdvancedDialog({
                   className="w-32"
                   onValueChange={(value) =>
                     updateSettings(
-                      backgroundActivityOverrideSettings(settings.backgroundActivity, {
-                        automaticGitFetchInterval: Duration.seconds(
-                          normalizeIntervalSeconds(value),
-                        ),
-                      }),
+                      backgroundActivityOverrideSettings(
+                        settings.backgroundActivity,
+                        resolvedBackgroundActivity,
+                        {
+                          automaticGitFetchInterval: Duration.seconds(
+                            normalizeIntervalSeconds(value),
+                          ),
+                        },
+                      ),
                     )
                   }
                 >
@@ -796,11 +809,15 @@ function BackgroundActivityAdvancedDialog({
                   className="w-32"
                   onValueChange={(value) =>
                     updateSettings(
-                      backgroundActivityOverrideSettings(settings.backgroundActivity, {
-                        providerHealthRefreshInterval: Duration.seconds(
-                          normalizeIntervalSeconds(value),
-                        ),
-                      }),
+                      backgroundActivityOverrideSettings(
+                        settings.backgroundActivity,
+                        resolvedBackgroundActivity,
+                        {
+                          providerHealthRefreshInterval: Duration.seconds(
+                            normalizeIntervalSeconds(value),
+                          ),
+                        },
+                      ),
                     )
                   }
                 >
@@ -830,11 +847,15 @@ function BackgroundActivityAdvancedDialog({
                   className="w-32"
                   onValueChange={(value) =>
                     updateSettings(
-                      backgroundActivityOverrideSettings(settings.backgroundActivity, {
-                        hostPowerMonitorActiveInterval: Duration.seconds(
-                          normalizeIntervalSeconds(value),
-                        ),
-                      }),
+                      backgroundActivityOverrideSettings(
+                        settings.backgroundActivity,
+                        resolvedBackgroundActivity,
+                        {
+                          hostPowerMonitorActiveInterval: Duration.seconds(
+                            normalizeIntervalSeconds(value, 5),
+                          ),
+                        },
+                      ),
                     )
                   }
                 >
@@ -864,11 +885,15 @@ function BackgroundActivityAdvancedDialog({
                   className="w-32"
                   onValueChange={(value) =>
                     updateSettings(
-                      backgroundActivityOverrideSettings(settings.backgroundActivity, {
-                        hostPowerMonitorIdleInterval: Duration.seconds(
-                          normalizeIntervalSeconds(value),
-                        ),
-                      }),
+                      backgroundActivityOverrideSettings(
+                        settings.backgroundActivity,
+                        resolvedBackgroundActivity,
+                        {
+                          hostPowerMonitorIdleInterval: Duration.seconds(
+                            normalizeIntervalSeconds(value, 5),
+                          ),
+                        },
+                      ),
                     )
                   }
                 >
@@ -893,9 +918,13 @@ function BackgroundActivityAdvancedDialog({
                     checked={resolvedBackgroundActivity[key]}
                     onCheckedChange={(checked) =>
                       updateSettings(
-                        backgroundActivityOverrideSettings(settings.backgroundActivity, {
-                          [key]: Boolean(checked),
-                        }),
+                        backgroundActivityOverrideSettings(
+                          settings.backgroundActivity,
+                          resolvedBackgroundActivity,
+                          {
+                            [key]: Boolean(checked),
+                          },
+                        ),
                       )
                     }
                     aria-label={label}
@@ -2027,9 +2056,13 @@ export function ProviderSettingsPanel() {
                 label="provider health check interval"
                 onClick={() =>
                   updateSettings(
-                    backgroundActivityOverrideSettings(settings.backgroundActivity, {
-                      providerHealthRefreshInterval: undefined,
-                    }),
+                    backgroundActivityOverrideSettings(
+                      settings.backgroundActivity,
+                      resolvedBackgroundActivity,
+                      {
+                        providerHealthRefreshInterval: undefined,
+                      },
+                    ),
                   )
                 }
               />
@@ -2045,11 +2078,15 @@ export function ProviderSettingsPanel() {
                 className="w-32"
                 onValueChange={(value) =>
                   updateSettings(
-                    backgroundActivityOverrideSettings(settings.backgroundActivity, {
-                      providerHealthRefreshInterval: Duration.seconds(
-                        normalizeIntervalSeconds(value),
-                      ),
-                    }),
+                    backgroundActivityOverrideSettings(
+                      settings.backgroundActivity,
+                      resolvedBackgroundActivity,
+                      {
+                        providerHealthRefreshInterval: Duration.seconds(
+                          normalizeIntervalSeconds(value),
+                        ),
+                      },
+                    ),
                   )
                 }
               >

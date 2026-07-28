@@ -85,6 +85,14 @@ function formatDurationMicros(value: number): string {
   return `${(value / 1_000_000).toFixed(2)} s`;
 }
 
+function formatSampleInterval(valueMs: number): string {
+  if (valueMs < 1_000) return `${Math.max(0, Math.round(valueMs))} ms`;
+  const seconds = valueMs / 1_000;
+  return `${seconds.toLocaleString(undefined, { maximumFractionDigits: 1 })} ${
+    seconds === 1 ? "second" : "seconds"
+  }`;
+}
+
 function processIdentityKey(process: ResourceTelemetryProcess): string {
   return `${process.identity.pid}:${process.identity.startTimeMs}`;
 }
@@ -958,7 +966,7 @@ export function ResourceTelemetryDiagnostics() {
             </div>
             <div className="flex items-center gap-2 text-[10px] text-muted-foreground/65">
               <span className="size-1.5 rounded-full bg-emerald-500" />
-              Sampling every 5 seconds
+              Sampling every {snapshot ? formatSampleInterval(snapshot.sampleIntervalMs) : "..."}
             </div>
           </div>
           <div className="grid grid-cols-2 divide-x divide-y divide-border/55 md:grid-cols-3">

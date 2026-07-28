@@ -2,7 +2,10 @@ import type { HostPowerSnapshot } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 
-import { resolveNativeSampleIntervalMs } from "./NativeTelemetryClient.ts";
+import {
+  canRequestNativeTelemetryRetry,
+  resolveNativeSampleIntervalMs,
+} from "./NativeTelemetryClient.ts";
 
 const basePower: HostPowerSnapshot = {
   source: "electron-main",
@@ -43,5 +46,15 @@ describe("resolveNativeSampleIntervalMs", () => {
       ),
     ).toBe(5_000);
     expect(resolveNativeSampleIntervalMs(basePower, 0)).toBe(1_000);
+  });
+});
+
+describe("canRequestNativeTelemetryRetry", () => {
+  it("only accepts retry while the supervisor is waiting without a live sidecar", () => {
+    expect(canRequestNativeTelemetryRetry("degraded", false)).toBe(true);
+    expect(canRequestNativeTelemetryRetry("unavailable", false)).toBe(true);
+    expect(canRequestNativeTelemetryRetry("degraded", true)).toBe(false);
+    expect(canRequestNativeTelemetryRetry("healthy", false)).toBe(false);
+    expect(canRequestNativeTelemetryRetry("starting", false)).toBe(false);
   });
 });
